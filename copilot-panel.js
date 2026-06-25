@@ -9,12 +9,9 @@
  *   <script
  *     src="copilot-panel.js"
  *     data-api-url="/api/financial-chat"
- *     data-transactions-var="myTransactionsArray"
  *   ></script>
  *
- * data-api-url         — (required) your backend endpoint URL
- * data-transactions-var — (optional) name of the global JS variable
- *                         holding transactions (e.g. window.transactions)
+ * data-api-url — (required) your backend endpoint URL
  *
  * Public API (all optional):
  *   window.CopilotPanel.open()
@@ -22,7 +19,7 @@
  *   window.CopilotPanel.toggle()
  *   window.CopilotPanel.send('Hello')
  *   window.CopilotPanel.clear()
- *   window.CopilotPanel.setTransactions([...])  ← update transactions at runtime
+ *   window.CopilotPanel.setAuthToken('your-supabase-token')
  */
 
 (function () {
@@ -40,21 +37,14 @@
     document.currentScript ||
     document.querySelector('script[data-api-url]');
 
-  const API_URL           = currentScript?.getAttribute('data-api-url') || null;
-  const TRANSACTIONS_VAR  = currentScript?.getAttribute('data-transactions-var') || 'transactions';
+  const API_URL = currentScript?.getAttribute('data-api-url') || null;
 
   if (!API_URL) {
     console.warn('[CopilotPanel] No data-api-url provided. Add data-api-url="/your/endpoint" to the script tag.');
   }
 
-  /* Helper to get transactions from the host page's global variable */
-  const getTransactions = () => {
-    try {
-      return window[TRANSACTIONS_VAR] ?? [];
-    } catch {
-      return [];
-    }
-  };
+  /* ── AUTH TOKEN ── */
+  let _authToken = null;
 
   /* ── 1. HOST ELEMENT (fixed to right edge) ── */
   const host = document.createElement(HOST_TAG);
@@ -110,14 +100,13 @@
     #close-btn:hover { background: #f1f5f9; color: #0f172a; }
     #close-btn svg { width: 16px; height: 16px; }
 
-    /* API badge */
-    #api-badge {
+    /* Auth badge */
+    #auth-badge {
       font-size: 10px; padding: 2px 7px; border-radius: 10px;
       background: #ecfdf5; color: #059669; border: 1px solid #a7f3d0;
-      white-space: nowrap; max-width: 120px; overflow: hidden;
-      text-overflow: ellipsis;
+      white-space: nowrap;
     }
-    #api-badge.no-api {
+    #auth-badge.no-auth {
       background: #fff7ed; color: #d97706; border-color: #fcd34d;
     }
 
@@ -217,17 +206,13 @@
   /* ── 3. PANEL HTML ── */
   const panel = document.createElement('div');
   panel.id = 'panel';
-
-  const apiBadgeText  = API_URL ? API_URL.replace(/^https?:\/\/[^/]+/, '') : 'No API configured';
-  const apiBadgeClass = API_URL ? '' : 'no-api';
-
   panel.innerHTML = `
     <div id="header">
       <div id="header-left">
         <div id="logo">✦</div>
         <div>
-          <div id="title">AI Assistant</div>
-          <div id="subtitle"><span id="api-badge" class="${apiBadgeClass}" title="${API_URL || ''}">${apiBadgeText}</span></div>
+          <div id="title">Finance Assistant</div>
+          <div id="subtitle"><span id="auth-badge" class="no-auth">Not authenticated</span></div>
         </div>
       </div>
       <button id="close-btn" aria-label="Close panel">
@@ -241,11 +226,11 @@
       <div id="empty-state">
         <div id="empty-icon">✦</div>
         <div id="empty-title">How can I help?</div>
-        <div id="empty-sub">Ask me anything about this page,<br>or start a conversation below.</div>
+        <div id="empty-sub">Ask me anything about your finances,<br>or start a conversation below.</div>
         <div id="chips">
           <button class="suggestion-chip">Summarize my finances</button>
           <button class="suggestion-chip">Show spending trends</button>
-          <button class="suggestion-chip">What should I do next?</button>
+          <button class="suggestion-chip">Where am I overspending?</button>
         </div>
       </div>
     </div>
@@ -266,7 +251,7 @@
   shadow.appendChild(style);
   shadow.appendChild(panel);
 
-  /* ── FAB button (real DOM, always visible when panel closed) ── */
+  /* ── FAB button ── */
   const fab = document.createElement('button');
   fab.setAttribute('aria-label', 'Open AI assistant');
   fab.innerHTML = `
@@ -299,9 +284,18 @@
   let isBusy = false;
   const messages = [];
 
-  /* Runtime override for transactions */
-  let _transactionsOverride = null;
-  const resolveTransactions = () => _transactionsOverride ?? getTransactions();
+  /* Update auth badge in header */
+  const updateAuthBadge = () => {
+    const badge = $('#auth-badge');
+    if (!badge) return;
+    if (_authToken) {
+      badge.textContent = 'Authenticated ✓';
+      badge.className = '';
+    } else {
+      badge.textContent = 'Not authenticated';
+      badge.className = 'no-auth';
+    }
+  };
 
   /* Auto-resize textarea */
   const inputEl = $('#input');
@@ -328,11 +322,11 @@
         <div id="empty-state">
           <div id="empty-icon">✦</div>
           <div id="empty-title">How can I help?</div>
-          <div id="empty-sub">Ask me anything about this page,<br>or start a conversation below.</div>
+          <div id="empty-sub">Ask me anything about your finances,<br>or start a conversation below.</div>
           <div id="chips">
             <button class="suggestion-chip">Summarize my finances</button>
             <button class="suggestion-chip">Show spending trends</button>
-            <button class="suggestion-chip">What should I do next?</button>
+            <button class="suggestion-chip">Where am I overspending?</button>
           </div>
         </div>`;
       bindChips();
@@ -370,16 +364,17 @@
   };
   const hideTyping = () => { if (typingEl) { typingEl.remove(); typingEl = null; } };
 
-  /* ── 6. API CALL ── */
+  /* ── 6. API CALL — only sends message, token in header ── */
   const sendToAPI = async (message) => {
     if (!API_URL) throw new Error('No API URL configured. Add data-api-url to the script tag.');
 
-    const transactions = resolveTransactions();
+    const headers = { 'Content-Type': 'application/json' };
+    if (_authToken) headers['Authorization'] = `Bearer ${_authToken}`;
 
     const res = await fetch(API_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, transactions }),
+      headers,
+      body: JSON.stringify({ message }), // ← only message, no transactions
     });
 
     if (!res.ok) {
@@ -388,8 +383,6 @@
     }
 
     const data = await res.json();
-
-    /* Support common response shapes: { reply }, { message }, { response }, { content }, { answer } */
     return (
       data.reply    ??
       data.message  ??
@@ -478,8 +471,11 @@
     toggle,
     send: sendMessage,
     clear() { messages.length = 0; renderMessages(); },
-    /** Override transactions at runtime: CopilotPanel.setTransactions([...]) */
-    setTransactions(txns) { _transactionsOverride = txns; },
+    setAuthToken(token) {
+      _authToken = token;
+      updateAuthBadge();
+      console.log('[CopilotPanel] Auth token set ✓');
+    },
   };
 
 })();
