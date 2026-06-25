@@ -6,7 +6,15 @@
  * Opens as a right-side split that PUSHES the page (no overlay).
  *
  * Usage:
- *   <script src="copilot-panel.js"></script>
+ *   <script
+ *     src="copilot-panel.js"
+ *     data-api-url="/api/financial-chat"
+ *     data-transactions-var="myTransactionsArray"
+ *   ></script>
+ *
+ * data-api-url         — (required) your backend endpoint URL
+ * data-transactions-var — (optional) name of the global JS variable
+ *                         holding transactions (e.g. window.transactions)
  *
  * Public API (all optional):
  *   window.CopilotPanel.open()
@@ -14,6 +22,7 @@
  *   window.CopilotPanel.toggle()
  *   window.CopilotPanel.send('Hello')
  *   window.CopilotPanel.clear()
+ *   window.CopilotPanel.setTransactions([...])  ← update transactions at runtime
  */
 
 (function () {
@@ -25,6 +34,27 @@
 
   /* Prevent double-injection */
   if (document.querySelector(HOST_TAG)) return;
+
+  /* ── READ CONFIG FROM SCRIPT TAG ── */
+  const currentScript =
+    document.currentScript ||
+    document.querySelector('script[data-api-url]');
+
+  const API_URL           = currentScript?.getAttribute('data-api-url') || null;
+  const TRANSACTIONS_VAR  = currentScript?.getAttribute('data-transactions-var') || 'transactions';
+
+  if (!API_URL) {
+    console.warn('[CopilotPanel] No data-api-url provided. Add data-api-url="/your/endpoint" to the script tag.');
+  }
+
+  /* Helper to get transactions from the host page's global variable */
+  const getTransactions = () => {
+    try {
+      return window[TRANSACTIONS_VAR] ?? [];
+    } catch {
+      return [];
+    }
+  };
 
   /* ── 1. HOST ELEMENT (fixed to right edge) ── */
   const host = document.createElement(HOST_TAG);
@@ -79,6 +109,17 @@
     }
     #close-btn:hover { background: #f1f5f9; color: #0f172a; }
     #close-btn svg { width: 16px; height: 16px; }
+
+    /* API badge */
+    #api-badge {
+      font-size: 10px; padding: 2px 7px; border-radius: 10px;
+      background: #ecfdf5; color: #059669; border: 1px solid #a7f3d0;
+      white-space: nowrap; max-width: 120px; overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #api-badge.no-api {
+      background: #fff7ed; color: #d97706; border-color: #fcd34d;
+    }
 
     /* Messages */
     #messages {
@@ -176,13 +217,17 @@
   /* ── 3. PANEL HTML ── */
   const panel = document.createElement('div');
   panel.id = 'panel';
+
+  const apiBadgeText  = API_URL ? API_URL.replace(/^https?:\/\/[^/]+/, '') : 'No API configured';
+  const apiBadgeClass = API_URL ? '' : 'no-api';
+
   panel.innerHTML = `
     <div id="header">
       <div id="header-left">
         <div id="logo">✦</div>
         <div>
           <div id="title">AI Assistant</div>
-          <div id="subtitle">Powered by Claude</div>
+          <div id="subtitle"><span id="api-badge" class="${apiBadgeClass}" title="${API_URL || ''}">${apiBadgeText}</span></div>
         </div>
       </div>
       <button id="close-btn" aria-label="Close panel">
@@ -198,8 +243,8 @@
         <div id="empty-title">How can I help?</div>
         <div id="empty-sub">Ask me anything about this page,<br>or start a conversation below.</div>
         <div id="chips">
-          <button class="suggestion-chip">Summarize this page</button>
-          <button class="suggestion-chip">Explain key concepts</button>
+          <button class="suggestion-chip">Summarize my finances</button>
+          <button class="suggestion-chip">Show spending trends</button>
           <button class="suggestion-chip">What should I do next?</button>
         </div>
       </div>
@@ -254,6 +299,10 @@
   let isBusy = false;
   const messages = [];
 
+  /* Runtime override for transactions */
+  let _transactionsOverride = null;
+  const resolveTransactions = () => _transactionsOverride ?? getTransactions();
+
   /* Auto-resize textarea */
   const inputEl = $('#input');
   inputEl.addEventListener('input', () => {
@@ -281,8 +330,8 @@
           <div id="empty-title">How can I help?</div>
           <div id="empty-sub">Ask me anything about this page,<br>or start a conversation below.</div>
           <div id="chips">
-            <button class="suggestion-chip">Summarize this page</button>
-            <button class="suggestion-chip">Explain key concepts</button>
+            <button class="suggestion-chip">Summarize my finances</button>
+            <button class="suggestion-chip">Show spending trends</button>
             <button class="suggestion-chip">What should I do next?</button>
           </div>
         </div>`;
@@ -290,11 +339,9 @@
       return;
     }
 
-    /* Remove empty state */
     const empty = $('#empty-state');
     if (empty) empty.remove();
 
-    /* Append only new messages */
     const existing = container.querySelectorAll('.msg').length;
     for (let i = existing; i < messages.length; i++) {
       const { role, text } = messages[i];
@@ -324,41 +371,34 @@
   const hideTyping = () => { if (typingEl) { typingEl.remove(); typingEl = null; } };
 
   /* ── 6. API CALL ── */
-  const ANTHROPIC_API_KEY = 'YOUR_API_KEY_HERE'; // Replace or proxy
-  const MODEL = 'claude-sonnet-4-6';
+  const sendToAPI = async (message) => {
+    if (!API_URL) throw new Error('No API URL configured. Add data-api-url to the script tag.');
 
-  const sendToLLM = async (userText) => {
-    const apiMessages = messages.map((m) => ({
-      role: m.role === 'bot' ? 'assistant' : 'user',
-      content: m.text,
-    }));
+    const transactions = resolveTransactions();
 
-    const systemPrompt = `You are a helpful AI assistant embedded in a webpage.
-Page title: ${document.title}
-URL: ${window.location.href}
-Answer concisely and helpfully. If asked to summarize, summarize the visible page topic.`;
-
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    const res = await fetch(API_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type':      'application/json',
-        'x-api-key':         ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model:      MODEL,
-        max_tokens: 1024,
-        system:     systemPrompt,
-        messages:   apiMessages,
-      }),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, transactions }),
     });
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(err.error?.message || `HTTP ${res.status}`);
+      throw new Error(err.error?.message || err.message || `HTTP ${res.status}`);
     }
+
     const data = await res.json();
-    return data.content?.[0]?.text ?? '(No response)';
+
+    /* Support common response shapes: { reply }, { message }, { response }, { content }, { answer } */
+    return (
+      data.reply    ??
+      data.message  ??
+      data.response ??
+      data.content  ??
+      data.answer   ??
+      data.text     ??
+      '(No response)'
+    );
   };
 
   /* ── 7. SEND FLOW ── */
@@ -376,7 +416,7 @@ Answer concisely and helpfully. If asked to summarize, summarize the visible pag
     showTyping();
 
     try {
-      const reply = await sendToLLM(text);
+      const reply = await sendToAPI(text);
       hideTyping();
       messages.push({ role: 'bot', text: reply });
       renderMessages();
@@ -432,7 +472,14 @@ Answer concisely and helpfully. If asked to summarize, summarize the visible pag
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && isOpen) close(); });
 
   /* ── 10. PUBLIC API ── */
-  window.CopilotPanel = { open, close, toggle, send: sendMessage,
-    clear() { messages.length = 0; renderMessages(); } };
+  window.CopilotPanel = {
+    open,
+    close,
+    toggle,
+    send: sendMessage,
+    clear() { messages.length = 0; renderMessages(); },
+    /** Override transactions at runtime: CopilotPanel.setTransactions([...]) */
+    setTransactions(txns) { _transactionsOverride = txns; },
+  };
 
 })();
